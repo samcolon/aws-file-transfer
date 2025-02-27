@@ -28,11 +28,13 @@ Before deploying, ensure you have:
 - An existing **S3 bucket** for storing files.
 - **AWS CLI** installed and configured with appropriate credentials.
 
+**Note:** These instructions are for deployment on **Windows OS** using **VSCode** with **WSL** installed.
+
 ### **Deploy the CloudFormation Stack**
 #### **1. Clone the Repository**
 ```bash
-git clone <repository-url>
-cd <repository-folder>
+git clone https://github.com/samcolon/aws-file-transfer.git
+cd aws-file-transfer
 ```
 
 #### **2. Deploy the CloudFormation Stack**
