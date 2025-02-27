@@ -1,0 +1,270 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "CloudFormation template to deploy AWS Transfer Family, IAM, EventBridge, and inline Lambda functions."
+
+Parameters:
+  BucketName:
+    Type: String
+    Description: "Enter the name of an existing S3 bucket"
+
+  TransferUserName:
+    Type: String
+    Description: "Specify the username for the AWS Transfer Family user"
+    Default: "testuser"
+
+  
+
+Resources:
+  # ---------------------------
+  # AWS Transfer Family (SFTP) Server
+  # ---------------------------
+  TransferServer:
+    Type: AWS::Transfer::Server
+    Properties:
+      EndpointType: PUBLIC
+      IdentityProviderType: SERVICE_MANAGED
+      Protocols:
+        - SFTP
+      LoggingRole: !GetAtt TransferLoggingRole.Arn
+
+  # ---------------------------
+  #IAM Role Granting AWS Transfer Family S3 Bucket Access
+  # ---------------------------
+  TransferUserRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: transfer.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: TransferS3Access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "s3:PutObject"
+                  - "s3:GetObject"
+                  - "s3:ListBucket"
+                Resource:
+                  - !Sub "arn:aws:s3:::${BucketName}"
+                  - !Sub "arn:aws:s3:::${BucketName}/*"
+  # ---------------------------
+  # Defining Transfer User
+  # ---------------------------
+  TransferUser:
+    Type: AWS::Transfer::User
+    Properties:
+      ServerId: !GetAtt TransferServer.ServerId
+      UserName: !Ref TransferUserName
+      Role: !GetAtt TransferUserRole.Arn
+      HomeDirectoryMappings:
+        - Entry: "/"
+          Target: !Sub "/${BucketName}"
+      HomeDirectoryType: LOGICAL
+
+  # ---------------------------
+  # IAM Role for AWS Transfer Family Logging
+  # ---------------------------
+  TransferLoggingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: transfer.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SFTPLoggingPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "s3:PutObject"
+                Resource: !Sub "arn:aws:s3:::${BucketName}/*"
+
+  # ---------------------------
+  # IAM Role for Lambda Execution (Includes S3 Permissions)
+  # ---------------------------
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaS3Permissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "s3:GetObject"
+                  - "s3:PutObject"
+                  - "s3:GetBucketNotification"
+                  - "s3:PutBucketNotification"
+                Resource:
+                  - !Sub "arn:aws:s3:::${BucketName}"
+                  - !Sub "arn:aws:s3:::${BucketName}/*"
+
+  # ---------------------------
+  # Lambda Function to Configure S3 EventBridge Notifications
+  # ---------------------------
+  S3NotificationLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Runtime: python3.8
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+
+          s3 = boto3.client("s3")
+
+          def lambda_handler(event, context):
+              try:
+                  bucket_name = event["ResourceProperties"]["BucketName"]
+                  
+                  # Configure S3 bucket to send events to EventBridge
+                  s3.put_bucket_notification_configuration(
+                      Bucket=bucket_name,
+                      NotificationConfiguration={"EventBridgeConfiguration": {}}
+                  )
+
+                  responseData = {"Message": "S3 EventBridge notification configured"}
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+              except Exception as e:
+                  responseData = {"Error": str(e)}
+                  cfnresponse.send(event, context, cfnresponse.FAILED, responseData)
+
+  # ---------------------------
+  # Custom Resource to Trigger the Lambda Function for S3 Notifications
+  # ---------------------------
+  S3NotificationSetup:
+    Type: Custom::S3NotificationSetup
+    Properties:
+      ServiceToken: !GetAtt S3NotificationLambda.Arn
+      BucketName: !Ref BucketName
+
+  # ---------------------------
+  # Lambda Function for File Decryption (INLINE CODE)
+  # ---------------------------
+  DecryptLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Runtime: python3.8
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+
+          s3 = boto3.client('s3')
+
+          def decrypt_file(file_content):
+              decrypted_content = file_content[::-1]  # Reverse content for testing
+              decryption_message = "\n I Decrypted this - Samuel Colon\n"
+              decrypted_content += decryption_message.encode('utf-8')
+              return decrypted_content
+
+          def lambda_handler(event, context):
+              try:
+                  print("Received event:", json.dumps(event, indent=2))
+
+                  bucket_name = event["detail"]["bucket"]["name"]
+                  object_key = event["detail"]["object"]["key"]
+
+                  print(f"Processing file: {object_key} from bucket: {bucket_name}")
+
+                  response = s3.get_object(Bucket=bucket_name, Key=object_key)
+                  file_content = response['Body'].read()
+
+                  print("File downloaded successfully.")
+
+                  decrypted_content = decrypt_file(file_content)
+
+                  print("File decrypted successfully.")
+
+                  new_key = f"decrypted/{object_key}"
+                  s3.put_object(Bucket=bucket_name, Key=new_key, Body=decrypted_content)
+
+                  print(f"Decrypted file saved at: {new_key}")
+
+                  return {
+                      "statusCode": 200,
+                      "body": json.dumps(f"Decrypted file saved at {new_key}")
+                  }
+
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {
+                      "statusCode": 500,
+                      "body": json.dumps(str(e))
+                  }
+
+  # ---------------------------
+  # EventBridge Rule to Trigger Lambda on S3 File Upload
+  # ---------------------------
+  S3EventBridgeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventPattern:
+        source:
+          - "aws.s3"
+        detail-type:
+          - "Object Created"
+        detail:
+          bucket:
+            name:
+              - !Ref BucketName
+      Targets:
+        - Arn: !GetAtt DecryptLambdaFunction.Arn
+          Id: "DecryptLambda"
+
+  # ---------------------------
+  # Permission for EventBridge to Invoke Lambda
+  # ---------------------------
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !Ref DecryptLambdaFunction
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt S3EventBridgeRule.Arn
+
+Outputs:
+  S3BucketName:
+    Description: "User-provided S3 bucket for file uploads"
+    Value: !Ref BucketName
+
+  TransferServerId:
+    Description: "AWS Transfer Family Server ID"
+    Value: !Ref TransferServer
+
+  TransferServerEndpoint:
+    Description: "AWS Transfer Family Server Endpoint"
+    Value: !Sub "s-${TransferServer}.server.transfer.${AWS::Region}.amazonaws.com"
+
+  LambdaFunctionArn:
+    Description: "ARN of the Decryption Lambda function"
+    Value: !GetAtt DecryptLambdaFunction.Arn
+
+  S3NotificationLambdaArn:
+    Description: "ARN of the S3 Notification Configuration Lambda function"
+    Value: !GetAtt S3NotificationLambda.Arn
